@@ -1,447 +1,403 @@
 // Copyright 2020-2021 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
-// Copyright 2020 Parity Technologies (UK) Ltd.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the "Software"),
-// to deal in the Software without restriction, including without limitation
-// the rights to use, copy, modify, merge, publish, distribute, sublicense,
-// and/or sell copies of the Software, and to permit persons to whom the
-// Software is furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
+//! # P2PNetworkBehaviour
+//!
+//! This module implements the [`P2PNetworkBehaviour`] that creates a [`ExpandedSwarm`] as entry point for all
+//! communication. It provides an interface to send request/ responses to other peers, manage the known peers, and poll
+//! for incoming events.
+//!
+//!
+//! # Example
+//!
+//! The below example initiates, and polls from a Swarm, and reponds to each incoming Ping with a Pong.
+//!
+//! ```no_run
+//! use async_std::task;
+//! use communication::behaviour::{BehaviourConfig, P2PEvent, P2PNetworkBehaviour, P2PReqResEvent};
+//! use core::ops::Deref;
+//! use libp2p::identity::Keypair;
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Debug, Clone, Serialize, Deserialize)]
+//! pub enum Request {
+//!     Ping,
+//! }
+//!
+//! #[derive(Debug, Clone, Serialize, Deserialize)]
+//! pub enum Response {
+//!     Pong,
+//! }
+//!
+//! task::block_on(async {
+//!     let local_keys = Keypair::generate_ed25519();
+//!     let config = BehaviourConfig::default();
+//!     let mut swarm = P2PNetworkBehaviour::<Request, Response>::init_swarm(local_keys, config)
+//!         .await
+//!         .expect("Init swarm failed.");
+//!     loop {
+//!         if let P2PEvent::RequestResponse(boxed_event) = swarm.next().await {
+//!             if let P2PReqResEvent::Req {
+//!                 peer_id,
+//!                 request_id,
+//!                 request: Request::Ping,
+//!             } = boxed_event.deref().clone()
+//!             {
+//!                 let res = swarm.behaviour_mut().send_response(&request_id, Response::Pong);
+//!                 if res.is_err() {
+//!                     break;
+//!                 }
+//!             }
+//!         }
+//!     }
+//! });
+//! ```
 
-pub mod handler;
+mod protocol;
 mod types;
 
-pub use handler::{MessageEvent, MessageProtocol, ProtocolSupport};
-pub use types::*;
-
-use futures::channel::oneshot;
-use handler::{RequestProtocol, RequestResponseHandler, RequestResponseHandlerEvent};
-use libp2p::{
-    core::{connection::ConnectionId, ConnectedPoint, Multiaddr, PeerId},
-    swarm::{DialPeerCondition, NetworkBehaviour, NetworkBehaviourAction, NotifyHandler, PollParameters},
-};
-use smallvec::SmallVec;
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    marker::PhantomData,
-    sync::{atomic::AtomicU64, Arc},
+use core::{
+    iter,
+    result::Result,
     task::{Context, Poll},
     time::Duration,
 };
+#[cfg(feature = "mdns")]
+use libp2p::mdns::{Mdns, MdnsConfig, MdnsEvent};
+use libp2p::{
+    core::{upgrade, Multiaddr, PeerId},
+    dns::DnsConfig,
+    identify::{Identify, IdentifyConfig, IdentifyEvent},
+    identity::Keypair,
+    noise::{self, NoiseConfig},
+    relay::{new_transport_and_behaviour, Relay, RelayConfig},
+    request_response::{
+        ProtocolSupport, RequestId, RequestResponse, RequestResponseConfig, RequestResponseEvent,
+        RequestResponseMessage, ResponseChannel,
+    },
+    swarm::{NetworkBehaviourAction, NetworkBehaviourEventProcess, PollParameters, Swarm},
+    tcp::TcpConfig,
+    websocket::WsConfig,
+    yamux::YamuxConfig,
+    NetworkBehaviour, Transport,
+};
+pub use protocol::MessageEvent;
+use protocol::{MessageCodec, MessageProtocol};
+use std::collections::HashMap;
+use thiserror::Error as DeriveError;
+pub use types::*;
 
+/// Error upon creating a new [`P2PNetworkBehaviour`]
+#[derive(Debug, DeriveError)]
+pub enum BehaviourError {
+    /// Error on the transport layer
+    #[error("Transport error: `{0}`")]
+    TransportError(String),
+
+    /// Error on upgrading the transport with noise authentication
+    #[error("Noise authentic error: `{0}")]
+    NoiseAuthenticError(String),
+
+    /// Error creating new mDNS behaviour
+    #[error("Mdns error: `{0}`")]
+    MdnsError(String),
+}
+
+/// Configuration for initiating the [`P2PNetworkBehaviour`].
 #[derive(Debug, Clone)]
-pub struct RequestResponseConfig {
-    request_timeout: Duration,
-    connection_timeout: Duration,
-    protocol_support: ProtocolSupport,
+pub struct BehaviourConfig {
+    /// Timeout for outgoing requests until a [`P2POutboundFailure::Timeout`] is emitted.
+    /// If none is specified, it defaults to 10s.
+    timeout: Option<Duration>,
+    /// Duration to keep an idle connection alive when no Request or Response is send.
+    /// If none is specified, it defaults to 10s.
+    keep_alive: Option<Duration>,
+    /// TTL to use for mDNS record
+    mdns_ttl: Option<Duration>,
+    /// Frequency for new peers via mDNS
+    mdns_query_interval: Option<Duration>,
 }
 
-impl Default for RequestResponseConfig {
+impl BehaviourConfig {
+    pub fn new(
+        timeout: Option<Duration>,
+        keep_alive: Option<Duration>,
+        mdns_ttl: Option<Duration>,
+        mdns_query_interval: Option<Duration>,
+    ) -> Self {
+        BehaviourConfig {
+            timeout,
+            keep_alive,
+            mdns_ttl,
+            mdns_query_interval,
+        }
+    }
+}
+
+impl Default for BehaviourConfig {
     fn default() -> Self {
-        Self {
-            connection_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
-            protocol_support: ProtocolSupport::Full,
+        BehaviourConfig {
+            timeout: None,
+            keep_alive: None,
+            mdns_ttl: None,
+            mdns_query_interval: None,
         }
     }
 }
 
-impl RequestResponseConfig {
-    pub fn set_connection_keep_alive(&mut self, timeout: Duration) -> &mut Self {
-        self.connection_timeout = timeout;
-        self
-    }
-
-    pub fn set_request_timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    pub fn set_protocol_support(&mut self, protocol_support: ProtocolSupport) -> &mut Self {
-        self.protocol_support = protocol_support;
-        self
-    }
+/// The [`P2PNetworkBehaviour`] determines the behaviour of the p2p-network.
+/// It combines the following protocols from libp2p
+/// - mDNS for peer discovery within the local network
+/// - identify-protocol to receive identifying information of the remote peer
+/// - RequestResponse Protocol for sending generic request `Req` and response `Res` messages
+///
+/// The P2PNetworkBehaviour itself is only effective if a new [`ExpandedSwarm`] is created for it, this
+/// swarm is the entry point for all communication to remote peers, and contains the current state.
+///
+/// The [`P2PNetworkBehaviour`] implements a custom poll method that creates [`P2PEvent`]s from the events of the
+/// different protocols, it can be polled with the `next()` or `next_event()` methods of the [`ExpandedSwarm`].
+#[derive(NetworkBehaviour)]
+#[behaviour(out_event = "P2PEvent<Req, Res>", poll_method = "poll")]
+pub struct P2PNetworkBehaviour<Req: MessageEvent, Res: MessageEvent> {
+    #[cfg(feature = "mdns")]
+    mdns: Mdns,
+    identify: Identify,
+    msg_proto: RequestResponse<MessageCodec<Req, Res>>,
+    relay: Relay,
+    #[behaviour(ignore)]
+    peers: HashMap<PeerId, Vec<Multiaddr>>,
+    #[behaviour(ignore)]
+    events: Vec<P2PEvent<Req, Res>>,
+    #[behaviour(ignore)]
+    response_channels: HashMap<RequestId, ResponseChannel<Res>>,
 }
 
-pub struct RequestResponse<Req, Res>
-where
-    Req: MessageEvent,
-    Res: MessageEvent,
-{
-    supported_protocols: SmallVec<[MessageProtocol; 2]>,
-    next_request_id: RequestId,
-    next_inbound_id: Arc<AtomicU64>,
-    config: RequestResponseConfig,
-    pending_events: VecDeque<NetworkBehaviourAction<RequestProtocol<Req, Res>, BehaviourEvent<Req, Res>>>,
-    connected: HashMap<PeerId, SmallVec<[Connection<Res>; 2]>>,
-    addresses: HashMap<PeerId, SmallVec<[Multiaddr; 6]>>,
-    pending_outbound_requests: HashMap<PeerId, SmallVec<[RequestProtocol<Req, Res>; 10]>>,
-    pending_inbound_responses: HashMap<RequestId, oneshot::Sender<Res>>,
-}
+impl<Req: MessageEvent, Res: MessageEvent> P2PNetworkBehaviour<Req, Res> {
+    /// Creates a new [`P2PNetworkBehaviour`] and returns the swarm for it.
+    /// The returned [`Swarm<P2PNetworkBehaviour>`] is the entry point for all communication with
+    /// remote peers, i.g. to send requests and responses.
+    /// Additionally to the methods of the [`P2PNetworkBehaviour`] there is a range of [`libp2p::ExpandedSwarm`]
+    /// functions that can be used for swarm interaction like dialing a new peer.
+    ///
+    ///
+    /// # Example
+    /// ```no_run
+    /// use async_std::task;
+    /// use communication::behaviour::{BehaviourConfig, P2PNetworkBehaviour};
+    /// use libp2p::identity::Keypair;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// pub enum Request {
+    ///     Ping,
+    /// }
+    ///
+    /// #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// pub enum Response {
+    ///     Pong,
+    /// }
+    ///
+    /// let local_keys = Keypair::generate_ed25519();
+    /// let config = BehaviourConfig::default();
+    /// let mut swarm = task::block_on(P2PNetworkBehaviour::<Request, Response>::init_swarm(local_keys, config))
+    ///     .expect("Init swarm failed.");
+    /// ```
+    pub async fn init_swarm(
+        local_keys: Keypair,
+        config: BehaviourConfig,
+    ) -> Result<Swarm<P2PNetworkBehaviour<Req, Res>>, BehaviourError> {
+        let local_peer_id = PeerId::from(local_keys.public());
 
-impl<Req, Res> RequestResponse<Req, Res>
-where
-    Req: MessageEvent,
-    Res: MessageEvent,
-{
-    pub fn new(supported_protocols: SmallVec<[MessageProtocol; 2]>, cfg: RequestResponseConfig) -> Self {
-        RequestResponse {
-            supported_protocols,
-            next_request_id: RequestId::new(1),
-            next_inbound_id: Arc::new(AtomicU64::new(1)),
-            config: cfg,
-            pending_events: VecDeque::new(),
-            connected: HashMap::new(),
-            addresses: HashMap::new(),
-            pending_outbound_requests: HashMap::new(),
-            pending_inbound_responses: HashMap::new(),
-        }
-    }
+        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
+            .into_authentic(&local_keys)
+            .map_err(|e| BehaviourError::NoiseAuthenticError(format!("Could not create authentic keypair: {:?}", e)))?;
+        // Use XX handshake pattern
+        let noise = NoiseConfig::xx(noise_keys).into_authenticated();
+        // Tcp layer with wrapper to resolve dns addresses
+        let dns_transport = DnsConfig::system(TcpConfig::new())
+            .await
+            .map_err(|e| BehaviourError::TransportError(format!("Could not create transport: {:?}", e)))?;
+        // The configured transport establishes connections via tcp with websockets as fallback
+        let transport = dns_transport.clone().or_transport(WsConfig::new(dns_transport));
 
-    pub fn send_request(&mut self, peer: &PeerId, request: Req) -> Option<RequestId> {
-        self.config.protocol_support.outbound().then(|| {
-            let request_id = self.next_request_id();
-            let request = RequestProtocol {
-                request_id,
-                protocols: self.supported_protocols.clone(),
-                request,
-                marker: PhantomData,
-            };
+        let (relay_transport, relay_behaviour) = new_transport_and_behaviour(RelayConfig::default(), transport);
+        // Negotiate authentication and multiplexing on all connections
+        let upgraded_transport = relay_transport
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise)
+            .multiplex(YamuxConfig::default())
+            .boxed();
 
-            if let Some(request) = self.try_send_request(peer, request) {
-                self.pending_events.push_back(NetworkBehaviourAction::DialPeer {
-                    peer_id: *peer,
-                    condition: DialPeerCondition::Disconnected,
-                });
-                self.pending_outbound_requests.entry(*peer).or_default().push(request);
+        // multicast DNS for peer discovery within a local network
+        #[cfg(feature = "mdns")]
+        let mdns = {
+            let mut mdns_config = MdnsConfig::default();
+            if let Some(ttl) = config.mdns_ttl {
+                mdns_config.ttl = ttl;
             }
-            request_id
-        })
-    }
-
-    pub fn send_response(&mut self, request_id: RequestId, response: Res) -> Result<(), Res> {
-        if let Some(channel) = self.pending_inbound_responses.remove(&request_id) {
-            channel.send(response)
-        } else {
-            Err(response)
-        }
-    }
-
-    pub fn add_address(&mut self, peer: &PeerId, address: Multiaddr) {
-        self.addresses.entry(*peer).or_default().push(address);
-    }
-
-    pub fn remove_address(&mut self, peer: &PeerId, address: &Multiaddr) {
-        let mut last = false;
-        if let Some(addresses) = self.addresses.get_mut(peer) {
-            addresses.retain(|a| a != address);
-            last = addresses.is_empty();
-        }
-        if last {
-            self.addresses.remove(peer);
-        }
-    }
-
-    pub fn is_connected(&self, peer: &PeerId) -> bool {
-        if let Some(connections) = self.connected.get(peer) {
-            !connections.is_empty()
-        } else {
-            false
-        }
-    }
-
-    pub fn is_pending_outbound(&self, peer: &PeerId, request_id: &RequestId) -> bool {
-        let est_conn = self
-            .connected
-            .get(peer)
-            .map(|cs| cs.iter().any(|c| c.pending_inbound_responses.contains(request_id)))
-            .unwrap_or(false);
-        let pen_conn = self
-            .pending_outbound_requests
-            .get(peer)
-            .map(|rps| rps.iter().any(|rp| rp.request_id == *request_id))
-            .unwrap_or(false);
-
-        est_conn || pen_conn
-    }
-
-    pub fn is_pending_inbound(&self, peer: &PeerId, request_id: &RequestId) -> bool {
-        self.connected
-            .get(peer)
-            .map(|cs| cs.iter().any(|c| c.pending_outbound_responses.contains_key(request_id)))
-            .unwrap_or(false)
-    }
-
-    fn next_request_id(&mut self) -> RequestId {
-        *self.next_request_id.inc()
-    }
-
-    fn try_send_request(
-        &mut self,
-        peer: &PeerId,
-        request: RequestProtocol<Req, Res>,
-    ) -> Option<RequestProtocol<Req, Res>> {
-        if let Some(connections) = self.connected.get_mut(peer) {
-            if connections.is_empty() {
-                return Some(request);
+            if let Some(query_interval) = config.mdns_query_interval {
+                mdns_config.query_interval = query_interval;
             }
-            let ix = (request.request_id.value() as usize) % connections.len();
-            let conn = &mut connections[ix];
-            conn.pending_inbound_responses.insert(request.request_id);
-            self.pending_events.push_back(NetworkBehaviourAction::NotifyHandler {
-                peer_id: *peer,
-                handler: NotifyHandler::One(conn.id),
-                event: request,
-            });
-            None
-        } else {
-            Some(request)
-        }
-    }
-
-    fn remove_pending_outbound_response(
-        &mut self,
-        peer: &PeerId,
-        connection: ConnectionId,
-        request: &RequestId,
-    ) -> bool {
-        self.get_connection_mut(peer, connection)
-            .map(|c| c.pending_outbound_responses.remove(request).is_some())
-            .unwrap_or(false)
-    }
-
-    fn remove_pending_inbound_response(
-        &mut self,
-        peer: &PeerId,
-        connection: ConnectionId,
-        request: &RequestId,
-    ) -> bool {
-        self.get_connection_mut(peer, connection)
-            .map(|c| c.pending_inbound_responses.remove(request))
-            .unwrap_or(false)
-    }
-
-    fn get_connection_mut(&mut self, peer: &PeerId, connection: ConnectionId) -> Option<&mut Connection<Res>> {
-        self.connected
-            .get_mut(peer)
-            .and_then(|connections| connections.iter_mut().find(|c| c.id == connection))
-    }
-}
-
-impl<Req, Res> NetworkBehaviour for RequestResponse<Req, Res>
-where
-    Req: MessageEvent,
-    Res: MessageEvent,
-{
-    type ProtocolsHandler = RequestResponseHandler<Req, Res>;
-    type OutEvent = BehaviourEvent<Req, Res>;
-
-    fn new_handler(&mut self) -> Self::ProtocolsHandler {
-        let inbound_protocols = self
-            .config
-            .protocol_support
-            .outbound()
-            .then(|| self.supported_protocols.clone())
-            .unwrap_or(SmallVec::new());
-        RequestResponseHandler::new(
-            inbound_protocols,
-            self.config.connection_timeout,
-            self.config.request_timeout,
-            self.next_inbound_id.clone(),
-        )
-    }
-
-    fn addresses_of_peer(&mut self, peer: &PeerId) -> Vec<Multiaddr> {
-        let mut addresses = Vec::new();
-        if let Some(connections) = self.connected.get(peer) {
-            addresses.extend(connections.iter().filter_map(|c| c.address.clone()))
-        }
-        if let Some(more) = self.addresses.get(peer) {
-            addresses.extend(more.into_iter().cloned());
-        }
-        addresses
-    }
-
-    fn inject_connected(&mut self, peer: &PeerId) {
-        if let Some(pending) = self.pending_outbound_requests.remove(peer) {
-            for request in pending {
-                let request = self.try_send_request(peer, request);
-                assert!(request.is_none());
+            Mdns::new(mdns_config)
+                .await
+                .map_err(|e| BehaviourError::MdnsError(e.to_string()))
+        }?;
+        // Identify protocol to receive identifying information of a remote peer once a connection
+        // was established
+        let identify = Identify::new(IdentifyConfig::new("/identify/0.1.0".into(), local_keys.public()));
+        // Enable Request- and Response-Messages with the generic MessageProtocol
+        let msg_proto = {
+            let mut cfg = RequestResponseConfig::default();
+            if let Some(timeout) = config.timeout {
+                cfg.set_request_timeout(timeout);
             }
-        }
-    }
-
-    fn inject_connection_established(&mut self, peer: &PeerId, conn: &ConnectionId, endpoint: &ConnectedPoint) {
-        let address = match endpoint {
-            ConnectedPoint::Dialer { address } => Some(address.clone()),
-            ConnectedPoint::Listener { .. } => None,
+            if let Some(keep_alive) = config.keep_alive {
+                cfg.set_connection_keep_alive(keep_alive);
+            }
+            let protocols = iter::once((MessageProtocol(), ProtocolSupport::Full));
+            RequestResponse::new(MessageCodec::<Req, Res>::default(), protocols, cfg)
         };
-        self.connected
-            .entry(*peer)
-            .or_default()
-            .push(Connection::new(*conn, address));
-    }
 
-    fn inject_connection_closed(&mut self, peer_id: &PeerId, conn: &ConnectionId, _: &ConnectedPoint) {
-        let connections = self
-            .connected
-            .get_mut(peer_id)
-            .expect("Expected some established connection to peer before closing.");
-
-        let mut connection = connections
-            .iter()
-            .position(|c| &c.id == conn)
-            .map(|p: usize| connections.remove(p))
-            .expect("Expected connection to be established before closing.");
-
-        if connections.is_empty() {
-            self.connected.remove(peer_id);
-        }
-
-        for (request_id, _) in connection.pending_outbound_responses.drain() {
-            self.pending_events
-                .push_back(NetworkBehaviourAction::GenerateEvent(BehaviourEvent {
-                    peer_id: *peer_id,
-                    request_id,
-                    event: RequestResponseEvent::SendResponse(Err(SendResponseError::ConnectionClosed)),
-                }));
-        }
-
-        for request_id in connection.pending_inbound_responses {
-            self.pending_events
-                .push_back(NetworkBehaviourAction::GenerateEvent(BehaviourEvent {
-                    peer_id: *peer_id,
-                    request_id,
-                    event: RequestResponseEvent::ReceiveResponse(Err(ReceiveResponseError::ConnectionClosed)),
-                }));
-        }
-    }
-
-    fn inject_disconnected(&mut self, peer: &PeerId) {
-        self.connected.remove(peer);
-    }
-
-    fn inject_dial_failure(&mut self, peer: &PeerId) {
-        if let Some(pending) = self.pending_outbound_requests.remove(peer) {
-            for request in pending {
-                self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(BehaviourEvent {
-                        peer_id: *peer,
-                        request_id: request.request_id,
-                        event: RequestResponseEvent::SendRequest(Err(SendRequestError::DialFailure)),
-                    }));
-            }
-        }
-    }
-
-    fn inject_event(&mut self, peer: PeerId, connection: ConnectionId, event: RequestResponseHandlerEvent<Req, Res>) {
-        let request_id = event.request_id().clone();
-        let req_res_event = match event {
-            RequestResponseHandlerEvent::Response {
-                ref request_id,
-                response,
-            } => {
-                let removed = self.remove_pending_inbound_response(&peer, connection, request_id);
-                debug_assert!(removed, "Expect request_id to be pending before receiving response.",);
-                RequestResponseEvent::ReceiveResponse(Ok(response))
-            }
-            RequestResponseHandlerEvent::Request {
-                request_id,
-                request,
-                sender,
-            } => match self.get_connection_mut(&peer, connection) {
-                Some(connection) => {
-                    let inserted = connection
-                        .pending_outbound_responses
-                        .insert(request_id, sender)
-                        .is_none();
-                    debug_assert!(inserted, "Expect id of new request to be unknown.");
-                    RequestResponseEvent::ReceiveRequest(Ok(request))
-                }
-                None => {
-                    let event = BehaviourEvent {
-                        peer_id: peer,
-                        request_id,
-                        event: RequestResponseEvent::ReceiveRequest(Ok(request)),
-                    };
-                    self.pending_events
-                        .push_back(NetworkBehaviourAction::GenerateEvent(event));
-                    RequestResponseEvent::SendResponse(Err(SendResponseError::ConnectionClosed))
-                }
-            },
-            RequestResponseHandlerEvent::ResponseSent(ref request_id) => {
-                let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
-                debug_assert!(removed, "Expect request_id to be pending before response is sent.");
-                RequestResponseEvent::SendResponse(Ok(()))
-            }
-            RequestResponseHandlerEvent::ResponseOmission(ref request_id) => {
-                let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
-                debug_assert!(removed, "Expect request_id to be pending before response is omitted.",);
-                RequestResponseEvent::SendResponse(Err(SendResponseError::ResponseOmission))
-            }
-            RequestResponseHandlerEvent::OutboundTimeout(ref request_id) => {
-                let removed = self.remove_pending_inbound_response(&peer, connection, &request_id);
-                debug_assert!(removed, "Expect request_id to be pending before request times out.");
-                RequestResponseEvent::ReceiveResponse(Err(ReceiveResponseError::Timeout))
-            }
-            RequestResponseHandlerEvent::InboundTimeout(ref request_id) => {
-                self.remove_pending_outbound_response(&peer, connection, request_id);
-                RequestResponseEvent::SendResponse(Err(SendResponseError::Timeout))
-            }
-            RequestResponseHandlerEvent::OutboundUnsupportedProtocols(ref request_id) => {
-                let removed = self.remove_pending_inbound_response(&peer, connection, request_id);
-                debug_assert!(removed, "Expect request_id to be pending before failing to connect.",);
-                RequestResponseEvent::SendRequest(Err(SendRequestError::UnsupportedProtocols))
-            }
-            RequestResponseHandlerEvent::InboundUnsupportedProtocols(_) => {
-                RequestResponseEvent::ReceiveRequest(Err(ReceiveRequestError::UnsupportedProtocols))
-            }
+        // The behaviour describes how the swarm handles events enables interacting with the
+        // network
+        let behaviour = P2PNetworkBehaviour {
+            #[cfg(feature = "mdns")]
+            mdns,
+            msg_proto,
+            identify,
+            relay: relay_behaviour,
+            peers: HashMap::new(),
+            events: Vec::new(),
+            response_channels: HashMap::new(),
         };
-        let behaviour_event = BehaviourEvent {
-            peer_id: peer,
-            request_id,
-            event: req_res_event,
-        };
-        self.pending_events
-            .push_back(NetworkBehaviourAction::GenerateEvent(behaviour_event));
+
+        // The swarm manages a pool of connections established through the transport and drives the
+        // NetworkBehaviour through emitting events triggered by activity on the managed connections.
+        Ok(Swarm::new(upgraded_transport, behaviour, local_peer_id))
     }
 
-    fn poll(
+    // Custom function that is called when the swarm is polled
+    fn poll<TEv>(
         &mut self,
-        _: &mut Context<'_>,
-        _: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<RequestProtocol<Req, Res>, Self::OutEvent>> {
-        if let Some(ev) = self.pending_events.pop_front() {
-            return Poll::Ready(ev);
-        } else if self.pending_events.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
-            self.pending_events.shrink_to_fit();
+        _cx: &mut Context<'_>,
+        _params: &mut impl PollParameters,
+    ) -> Poll<NetworkBehaviourAction<TEv, P2PEvent<Req, Res>>> {
+        if !self.events.is_empty() {
+            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(self.events.remove(0)));
         }
-
         Poll::Pending
     }
-}
 
-const EMPTY_QUEUE_SHRINK_THRESHOLD: usize = 100;
-
-struct Connection<Res> {
-    id: ConnectionId,
-    address: Option<Multiaddr>,
-    pending_outbound_responses: HashMap<RequestId, oneshot::Sender<Res>>,
-    pending_inbound_responses: HashSet<RequestId>,
-}
-
-impl<Res> Connection<Res> {
-    fn new(id: ConnectionId, address: Option<Multiaddr>) -> Self {
-        Self {
-            id,
-            address,
-            pending_outbound_responses: Default::default(),
-            pending_inbound_responses: Default::default(),
+    pub fn add_peer_addr(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        if let Some(addrs) = self.peers.get_mut(&peer_id) {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        } else {
+            self.peers.insert(peer_id, vec![addr]);
         }
     }
+
+    pub fn remove_peer_addr(&mut self, peer_id: &PeerId, addr: &Multiaddr) {
+        if let Some(addrs) = self.peers.get_mut(peer_id) {
+            addrs.retain(|a| a != addr);
+        }
+    }
+
+    pub fn remove_peer(&mut self, peer_id: &PeerId) -> Option<Vec<Multiaddr>> {
+        self.peers.remove(peer_id)
+    }
+
+    pub fn get_peer_addr(&self, peer_id: &PeerId) -> Option<&Vec<Multiaddr>> {
+        self.peers.get(peer_id)
+    }
+
+    pub fn get_all_peers(&self) -> Vec<&PeerId> {
+        self.peers.keys().collect()
+    }
+
+    #[cfg(feature = "mdns")]
+    /// Get the peers discovered by mdns
+    pub fn get_active_mdns_peers(&mut self) -> Vec<&PeerId> {
+        self.mdns.discovered_nodes().collect()
+    }
+
+    pub fn send_request(&mut self, peer_id: &PeerId, request: Req) -> RequestId {
+        self.msg_proto.send_request(peer_id, request)
+    }
+
+    pub fn send_response(&mut self, request_id: &RequestId, response: Res) -> Result<(), Res> {
+        let channel = self
+            .response_channels
+            .remove(request_id)
+            .ok_or_else(|| response.clone())?;
+        self.msg_proto.send_response(channel, response)
+    }
+}
+
+#[cfg(feature = "mdns")]
+impl<Req: MessageEvent, Res: MessageEvent> NetworkBehaviourEventProcess<MdnsEvent> for P2PNetworkBehaviour<Req, Res> {
+    // Called when `mdns` produces an event.
+    fn inject_event(&mut self, event: MdnsEvent) {
+        match event {
+            MdnsEvent::Discovered(list) => {
+                for (peer_id, multiaddr) in list {
+                    self.add_peer_addr(peer_id, multiaddr);
+                }
+            }
+            MdnsEvent::Expired(list) => {
+                for (peer_id, multiaddr) in list {
+                    self.remove_peer_addr(&peer_id, &multiaddr);
+                }
+            }
+        }
+    }
+}
+
+impl<Req: MessageEvent, Res: MessageEvent> NetworkBehaviourEventProcess<RequestResponseEvent<Req, Res>>
+    for P2PNetworkBehaviour<Req, Res>
+{
+    // Called when a request or response was received.
+    fn inject_event(&mut self, event: RequestResponseEvent<Req, Res>) {
+        let communication_event = if let RequestResponseEvent::Message {
+            peer,
+            message:
+                RequestResponseMessage::Request {
+                    request_id,
+                    request,
+                    channel,
+                },
+        } = event
+        {
+            self.response_channels.insert(request_id, channel);
+            P2PEvent::RequestResponse(Box::new(P2PReqResEvent::Req {
+                peer_id: peer,
+                request_id,
+                request,
+            }))
+        } else {
+            P2PEvent::from(event)
+        };
+        self.events.push(communication_event);
+    }
+}
+
+impl<Req: MessageEvent, Res: MessageEvent> NetworkBehaviourEventProcess<IdentifyEvent>
+    for P2PNetworkBehaviour<Req, Res>
+{
+    // Called when `identify` produces an event.
+    fn inject_event(&mut self, event: IdentifyEvent) {
+        if let IdentifyEvent::Received { peer_id, ref info } = event {
+            if self.get_peer_addr(&peer_id).is_none() {
+                for addr in &info.listen_addrs {
+                    self.add_peer_addr(peer_id, addr.clone());
+                }
+            }
+        }
+        self.events.push(P2PEvent::from(event));
+    }
+}
+
+impl<Req: MessageEvent, Res: MessageEvent> NetworkBehaviourEventProcess<()> for P2PNetworkBehaviour<Req, Res> {
+    fn inject_event(&mut self, _: ()) {}
 }
