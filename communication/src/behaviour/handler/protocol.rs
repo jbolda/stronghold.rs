@@ -30,7 +30,7 @@ pub trait MessageEvent: Serialize + DeserializeOwned + Send + 'static {}
 impl<T: Serialize + DeserializeOwned + Send + 'static> MessageEvent for T {}
 
 #[derive(Debug, Clone)]
-pub struct MessageProtocol();
+pub struct MessageProtocol;
 
 impl ProtocolName for MessageProtocol {
     fn protocol_name(&self) -> &[u8] {

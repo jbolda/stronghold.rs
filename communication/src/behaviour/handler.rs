@@ -91,13 +91,35 @@ where
         request: Req,
         sender: oneshot::Sender<Res>,
     },
-    Response { request_id: RequestId, response: Res },
+    Response {
+        request_id: RequestId,
+        response: Res,
+    },
     ResponseSent(RequestId),
     ResponseOmission(RequestId),
     OutboundTimeout(RequestId),
     OutboundUnsupportedProtocols(RequestId),
     InboundTimeout(RequestId),
     InboundUnsupportedProtocols(RequestId),
+}
+
+impl<Req, Res> RequestResponseHandlerEvent<Req, Res>
+where
+    Req: MessageEvent,
+    Res: MessageEvent,
+{
+    pub fn request_id(&self) -> &RequestId {
+        match self {
+            RequestResponseHandlerEvent::Request { request_id, .. }
+            | RequestResponseHandlerEvent::Response { request_id, .. }
+            | RequestResponseHandlerEvent::ResponseSent(request_id)
+            | RequestResponseHandlerEvent::ResponseOmission(request_id)
+            | RequestResponseHandlerEvent::OutboundTimeout(request_id)
+            | RequestResponseHandlerEvent::OutboundUnsupportedProtocols(request_id)
+            | RequestResponseHandlerEvent::InboundTimeout(request_id)
+            | RequestResponseHandlerEvent::InboundUnsupportedProtocols(request_id) => request_id,
+        }
+    }
 }
 
 impl<Req, Res> ProtocolsHandler for RequestResponseHandler<Req, Res>
@@ -118,7 +140,7 @@ where
 
         let (rs_send, rs_recv) = oneshot::channel();
 
-        let request_id = RequestId(self.inbound_request_id.fetch_add(1, Ordering::Relaxed));
+        let request_id = RequestId::new(self.inbound_request_id.fetch_add(1, Ordering::Relaxed));
 
         let proto = ResponseProtocol {
             protocols: self.inbound_protocols.clone(),
@@ -211,8 +233,7 @@ where
                         sender: rs_sender,
                     }));
                 }
-                Err(oneshot::Canceled) => {
-                }
+                Err(oneshot::Canceled) => {}
             }
         }
 
